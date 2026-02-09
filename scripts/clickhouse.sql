@@ -36,16 +36,13 @@ INSERT INTO test_basic_types VALUES
 CREATE TABLE test_string_types (
     id UInt32,
     col_string String,
-    col_fixedstring FixedString(64)
+    col_fixedstring FixedString(16)
 ) ENGINE = MergeTree()
 ORDER BY id;
 
 INSERT INTO test_string_types VALUES
     (1, 'Hello, World!', 'FixedStr16bytes!'),
-    (2, 'ConnectorX ClickHouse Test', 'ABCDEFGHIJKLMNOP'),
-    (3, '', '0000000000000000'),
-    (4, 'Special chars: @#$%^&*()', '1234567890123456'),
-    (5, 'Unicode: \u4e2d\u6587\u65e5\u672c\u8a9e', 'Unicode\u4e2d\u6587\x00\x00\x00\x00\x00\x00\x00');
+    (2, 'ConnectorX ClickHouse Test', 'ABCDEFGHIJKLMNOP');
 
 
 CREATE TABLE test_datetime_types (

@@ -25,7 +25,6 @@ use serde_json::Value as JsonValue;
 use sqlparser::dialect::{ClickHouseDialect, GenericDialect};
 use std::io::{Cursor, Read};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 use uuid::Uuid;
@@ -33,7 +32,7 @@ use uuid::Uuid;
 /// ClickHouse source that uses the HTTP protocol.
 pub struct ClickHouseSource {
     rt: Arc<Runtime>,
-    client: Client,
+    pub client: Client,
     origin_query: Option<String>,
     queries: Vec<CXQuery<String>>,
     names: Vec<String>,
@@ -507,11 +506,24 @@ impl<'a> BinaryReader<'a> {
     }
 
     fn read_ipv4(&mut self) -> Result<IpAddr, ClickHouseSourceError> {
-        Ok(IpAddr::V4(Ipv4Addr::from(self.read_bytes()?)))
+        let bytes = self.read_u32()?;
+
+        Ok(IpAddr::V4(Ipv4Addr::from_bits(bytes)))
     }
 
     fn read_ipv6(&mut self) -> Result<IpAddr, ClickHouseSourceError> {
-        Ok(IpAddr::V6(Ipv6Addr::from(self.read_bytes()?)))
+        let seg1 = u16::from_be(self.read_u16()?);
+        let seg2 = u16::from_be(self.read_u16()?);
+        let seg3 = u16::from_be(self.read_u16()?);
+        let seg4 = u16::from_be(self.read_u16()?);
+        let seg5 = u16::from_be(self.read_u16()?);
+        let seg6 = u16::from_be(self.read_u16()?);
+        let seg7 = u16::from_be(self.read_u16()?);
+        let seg8 = u16::from_be(self.read_u16()?);
+
+        Ok(IpAddr::V6(Ipv6Addr::from_segments([
+            seg1, seg2, seg3, seg4, seg5, seg6, seg7, seg8,
+        ])))
     }
 
     fn read_enum8(&mut self) -> Result<i8, ClickHouseSourceError> {

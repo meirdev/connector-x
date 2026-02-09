@@ -1,0 +1,890 @@
+//! Source implementation for ClickHouse using the native protocol.
+
+mod errors;
+mod typesystem;
+
+pub use self::errors::ClickHouseSourceError;
+pub use self::typesystem::{ClickHouseTypeSystem, TypeMetadata};
+
+use crate::{
+    data_order::DataOrder,
+    errors::ConnectorXError,
+    sources::{
+        clickhouse::typesystem::DataType, PartitionParser, Produce, Source, SourcePartition,
+    },
+    sql::{count_query, limit1_query, CXQuery},
+};
+use anyhow::anyhow;
+use chrono::{DateTime, Duration, NaiveDate, NaiveTime, Utc};
+use chrono_tz::Tz;
+use clickhouse::Client;
+use fehler::{throw, throws};
+use rust_decimal::Decimal;
+use serde::Deserialize;
+use serde_json::Value as JsonValue;
+use sqlparser::dialect::{ClickHouseDialect, GenericDialect};
+use std::io::{Cursor, Read};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::str::FromStr;
+use std::sync::Arc;
+use tokio::runtime::Runtime;
+use uuid::Uuid;
+
+/// ClickHouse source that uses the HTTP protocol.
+pub struct ClickHouseSource {
+    rt: Arc<Runtime>,
+    client: Client,
+    origin_query: Option<String>,
+    queries: Vec<CXQuery<String>>,
+    names: Vec<String>,
+    schema: Vec<ClickHouseTypeSystem>,
+    metadata: Vec<TypeMetadata>,
+}
+
+impl ClickHouseSource {
+    #[throws(ClickHouseSourceError)]
+    pub fn new(rt: Arc<Runtime>, conn: &str) -> Self {
+        let url = url::Url::parse(conn)?;
+
+        let use_https = url
+            .query_pairs()
+            .find(|(k, v)| k == "protocol" && v == "https")
+            .is_some();
+
+        let base_url = format!(
+            "{}://{}:{}",
+            if use_https { "https" } else { "http" },
+            url.host_str().unwrap_or("localhost"),
+            url.port().unwrap_or(8123)
+        );
+
+        let mut client = Client::default().with_url(&base_url);
+
+        let database = url.path().trim_start_matches('/');
+        if !database.is_empty() {
+            client = client.with_database(database);
+        }
+
+        let username = url.username();
+        if !username.is_empty() {
+            client = client.with_user(username);
+        }
+
+        let password = url.password().unwrap_or("");
+        if !password.is_empty() {
+            client = client.with_password(password);
+        }
+
+        Self {
+            rt,
+            client,
+            origin_query: None,
+            queries: vec![],
+            names: vec![],
+            schema: vec![],
+            metadata: vec![],
+        }
+    }
+}
+
+impl Source for ClickHouseSource
+where
+    ClickHouseSourcePartition:
+        SourcePartition<TypeSystem = ClickHouseTypeSystem, Error = ClickHouseSourceError>,
+{
+    const DATA_ORDERS: &'static [DataOrder] = &[DataOrder::RowMajor];
+    type Partition = ClickHouseSourcePartition;
+    type TypeSystem = ClickHouseTypeSystem;
+    type Error = ClickHouseSourceError;
+
+    #[throws(ClickHouseSourceError)]
+    fn set_data_order(&mut self, data_order: DataOrder) {
+        if !matches!(data_order, DataOrder::RowMajor) {
+            throw!(ConnectorXError::UnsupportedDataOrder(data_order));
+        }
+    }
+
+    fn set_queries<Q: ToString>(&mut self, queries: &[CXQuery<Q>]) {
+        self.queries = queries.iter().map(|q| q.map(Q::to_string)).collect();
+    }
+
+    fn set_origin_query(&mut self, query: Option<String>) {
+        self.origin_query = query;
+    }
+
+    #[throws(ClickHouseSourceError)]
+    fn fetch_metadata(&mut self) {
+        assert!(!self.queries.is_empty());
+
+        let first_query = &self.queries[0];
+        let l1query = limit1_query(first_query, &ClickHouseDialect {})?;
+
+        let describe_query = format!("DESCRIBE ({})", l1query.as_str());
+
+        let response = self.rt.block_on(async {
+            let mut cursor = self
+                .client
+                .query(&describe_query)
+                .fetch_bytes("JSONCompact")
+                .map_err(|e| anyhow!("ClickHouse error: {}", e))?;
+            let bytes = cursor
+                .collect()
+                .await
+                .map_err(|e| anyhow!("ClickHouse error: {}", e))?;
+            Ok::<_, ClickHouseSourceError>(bytes)
+        })?;
+
+        #[derive(Debug, Deserialize)]
+        struct DescribeResponse {
+            data: Vec<Vec<JsonValue>>,
+        }
+
+        let parsed: DescribeResponse = serde_json::from_slice(&response)
+            .map_err(|e| anyhow!("Failed to parse DESCRIBE response: {}", e))?;
+
+        let mut names = Vec::new();
+        let mut types = Vec::new();
+        let mut metadata = Vec::new();
+
+        for row in parsed.data {
+            if row.len() >= 2 {
+                let name = row[0].as_str().unwrap_or("").to_string();
+                let type_str = row[1].as_str().unwrap_or("String");
+                let (ts, meta) = ClickHouseTypeSystem::from_type_str_with_metadata(type_str);
+                names.push(name);
+                types.push(ts);
+                metadata.push(meta);
+            }
+        }
+
+        self.names = names;
+        self.schema = types;
+        self.metadata = metadata;
+    }
+
+    #[throws(ClickHouseSourceError)]
+    fn result_rows(&mut self) -> Option<usize> {
+        match &self.origin_query {
+            Some(q) => {
+                let cxq = CXQuery::Naked(q.clone());
+                let cquery = count_query(&cxq, &ClickHouseDialect {})?;
+
+                let response = self.rt.block_on(async {
+                    let mut cursor = self
+                        .client
+                        .query(cquery.as_str())
+                        .fetch_bytes("JSONCompact")
+                        .map_err(|e| anyhow!("ClickHouse error: {}", e))?;
+                    let bytes = cursor
+                        .collect()
+                        .await
+                        .map_err(|e| anyhow!("ClickHouse error: {}", e))?;
+                    Ok::<_, ClickHouseSourceError>(bytes)
+                })?;
+
+                #[derive(Debug, Deserialize)]
+                struct CountResponse {
+                    data: Vec<Vec<JsonValue>>,
+                }
+
+                let parsed: CountResponse = serde_json::from_slice(&response)
+                    .map_err(|e| anyhow!("Failed to parse count response: {}", e))?;
+
+                if let Some(row) = parsed.data.first() {
+                    if let Some(count_val) = row.first() {
+                        let count = match count_val {
+                            JsonValue::Number(n) => n.as_u64().unwrap_or(0),
+                            JsonValue::String(s) => s.parse().unwrap_or(0),
+                            _ => 0,
+                        };
+                        return Some(count as usize);
+                    }
+                }
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn names(&self) -> Vec<String> {
+        self.names.clone()
+    }
+
+    fn schema(&self) -> Vec<Self::TypeSystem> {
+        self.schema.clone()
+    }
+
+    #[throws(ClickHouseSourceError)]
+    fn partition(self) -> Vec<Self::Partition> {
+        let mut ret = vec![];
+        for query in self.queries {
+            ret.push(ClickHouseSourcePartition::new(
+                self.rt.clone(),
+                self.client.clone(),
+                &query,
+                &self.schema,
+                &self.metadata,
+            ));
+        }
+        ret
+    }
+}
+
+pub struct ClickHouseSourcePartition {
+    rt: Arc<Runtime>,
+    client: Client,
+    query: CXQuery<String>,
+    schema: Vec<ClickHouseTypeSystem>,
+    metadata: Vec<TypeMetadata>,
+    nrows: usize,
+    ncols: usize,
+}
+
+impl ClickHouseSourcePartition {
+    pub fn new(
+        rt: Arc<Runtime>,
+        client: Client,
+        query: &CXQuery<String>,
+        schema: &[ClickHouseTypeSystem],
+        metadata: &[TypeMetadata],
+    ) -> Self {
+        Self {
+            rt,
+            client,
+            query: query.clone(),
+            schema: schema.to_vec(),
+            metadata: metadata.to_vec(),
+            nrows: 0,
+            ncols: schema.len(),
+        }
+    }
+}
+
+impl SourcePartition for ClickHouseSourcePartition {
+    type TypeSystem = ClickHouseTypeSystem;
+    type Parser<'a> = ClickHouseSourceParser<'a>;
+    type Error = ClickHouseSourceError;
+
+    #[throws(ClickHouseSourceError)]
+    fn result_rows(&mut self) {
+        let cquery = count_query(&self.query, &GenericDialect {})?;
+
+        let response = self.rt.block_on(async {
+            let mut cursor = self
+                .client
+                .query(cquery.as_str())
+                .fetch_bytes("JSONCompact")
+                .map_err(|e| anyhow!("ClickHouse error: {}", e))?;
+            let bytes = cursor
+                .collect()
+                .await
+                .map_err(|e| anyhow!("ClickHouse error: {}", e))?;
+            Ok::<_, ClickHouseSourceError>(bytes)
+        })?;
+
+        #[derive(Debug, Deserialize)]
+        struct CountResponse {
+            data: Vec<Vec<JsonValue>>,
+        }
+
+        let parsed: CountResponse = serde_json::from_slice(&response)
+            .map_err(|e| anyhow!("Failed to parse count response: {}", e))?;
+
+        if let Some(row) = parsed.data.first() {
+            if let Some(count_val) = row.first() {
+                let count = match count_val {
+                    JsonValue::Number(n) => n.as_u64().unwrap_or(0),
+                    JsonValue::String(s) => s.parse().unwrap_or(0),
+                    _ => 0,
+                };
+                self.nrows = count as usize;
+            }
+        }
+    }
+
+    #[throws(ClickHouseSourceError)]
+    fn parser(&mut self) -> Self::Parser<'_> {
+        ClickHouseSourceParser::new(
+            self.rt.clone(),
+            self.client.clone(),
+            self.query.clone(),
+            &self.schema,
+            &self.metadata,
+        )?
+    }
+
+    fn nrows(&self) -> usize {
+        self.nrows
+    }
+
+    fn ncols(&self) -> usize {
+        self.ncols
+    }
+}
+
+struct BinaryReader<'a> {
+    cursor: Cursor<&'a [u8]>,
+}
+
+impl<'a> BinaryReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            cursor: Cursor::new(data),
+        }
+    }
+
+    fn read_u8(&mut self) -> Result<u8, ClickHouseSourceError> {
+        let mut buf = [0u8; 1];
+        self.cursor
+            .read_exact(&mut buf)
+            .map_err(|e| anyhow!("Failed to read u8: {}", e))?;
+        Ok(buf[0])
+    }
+
+    fn read_i8(&mut self) -> Result<i8, ClickHouseSourceError> {
+        Ok(self.read_u8()? as i8)
+    }
+
+    fn read_u16(&mut self) -> Result<u16, ClickHouseSourceError> {
+        let mut buf = [0u8; 2];
+        self.cursor
+            .read_exact(&mut buf)
+            .map_err(|e| anyhow!("Failed to read u16: {}", e))?;
+        Ok(u16::from_le_bytes(buf))
+    }
+
+    fn read_i16(&mut self) -> Result<i16, ClickHouseSourceError> {
+        let mut buf = [0u8; 2];
+        self.cursor
+            .read_exact(&mut buf)
+            .map_err(|e| anyhow!("Failed to read i16: {}", e))?;
+        Ok(i16::from_le_bytes(buf))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, ClickHouseSourceError> {
+        let mut buf = [0u8; 4];
+        self.cursor
+            .read_exact(&mut buf)
+            .map_err(|e| anyhow!("Failed to read u32: {}", e))?;
+        Ok(u32::from_le_bytes(buf))
+    }
+
+    fn read_i32(&mut self) -> Result<i32, ClickHouseSourceError> {
+        let mut buf = [0u8; 4];
+        self.cursor
+            .read_exact(&mut buf)
+            .map_err(|e| anyhow!("Failed to read i32: {}", e))?;
+        Ok(i32::from_le_bytes(buf))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, ClickHouseSourceError> {
+        let mut buf = [0u8; 8];
+        self.cursor
+            .read_exact(&mut buf)
+            .map_err(|e| anyhow!("Failed to read u64: {}", e))?;
+        Ok(u64::from_le_bytes(buf))
+    }
+
+    fn read_i64(&mut self) -> Result<i64, ClickHouseSourceError> {
+        let mut buf = [0u8; 8];
+        self.cursor
+            .read_exact(&mut buf)
+            .map_err(|e| anyhow!("Failed to read i64: {}", e))?;
+        Ok(i64::from_le_bytes(buf))
+    }
+
+    fn read_f32(&mut self) -> Result<f32, ClickHouseSourceError> {
+        let mut buf = [0u8; 4];
+        self.cursor
+            .read_exact(&mut buf)
+            .map_err(|e| anyhow!("Failed to read f32: {}", e))?;
+        Ok(f32::from_le_bytes(buf))
+    }
+
+    fn read_f64(&mut self) -> Result<f64, ClickHouseSourceError> {
+        let mut buf = [0u8; 8];
+        self.cursor
+            .read_exact(&mut buf)
+            .map_err(|e| anyhow!("Failed to read f64: {}", e))?;
+        Ok(f64::from_le_bytes(buf))
+    }
+
+    fn read_varint(&mut self) -> Result<u64, ClickHouseSourceError> {
+        let mut result: u64 = 0;
+        let mut shift = 0;
+        loop {
+            let byte = self.read_u8()?;
+            result |= ((byte & 0x7f) as u64) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift >= 64 {
+                return Err(anyhow!("Varint too long").into());
+            }
+        }
+        Ok(result)
+    }
+
+    fn read_string(&mut self) -> Result<String, ClickHouseSourceError> {
+        let len = self.read_varint()? as usize;
+        let mut buf = vec![0u8; len];
+        self.cursor
+            .read_exact(&mut buf)
+            .map_err(|e| anyhow!("Failed to read string: {}", e))?;
+        String::from_utf8(buf).map_err(|e| anyhow!("Invalid UTF-8: {}", e).into())
+    }
+
+    fn read_uuid(&mut self) -> Result<Uuid, ClickHouseSourceError> {
+        // ClickHouse stores UUID as two UInt64 in big-endian order
+        let high = self.read_u64()?;
+        let low = self.read_u64()?;
+        // Reconstruct UUID bytes
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&high.to_be_bytes());
+        bytes[8..16].copy_from_slice(&low.to_be_bytes());
+        Ok(Uuid::from_bytes(bytes))
+    }
+
+    fn read_bool(&mut self) -> Result<bool, ClickHouseSourceError> {
+        Ok(self.read_u8()? != 0)
+    }
+
+    fn read_fixed_string(&mut self, len: usize) -> Result<Vec<u8>, ClickHouseSourceError> {
+        let mut buf = vec![0u8; len];
+        self.cursor
+            .read_exact(&mut buf)
+            .map_err(|e| anyhow!("Failed to read FixedString: {}", e))?;
+        Ok(buf)
+    }
+
+    fn read_date(&mut self) -> Result<NaiveDate, ClickHouseSourceError> {
+        let days = self.read_u16()? as i64;
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        epoch
+            .checked_add_signed(Duration::days(days))
+            .ok_or_else(|| anyhow!("Invalid date value: {} days since epoch", days).into())
+    }
+
+    fn read_date32(&mut self) -> Result<NaiveDate, ClickHouseSourceError> {
+        let days = self.read_i32()? as i64;
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+        epoch
+            .checked_add_signed(Duration::days(days))
+            .ok_or_else(|| anyhow!("Invalid date32 value: {} days since epoch", days).into())
+    }
+
+    fn read_datetime(&mut self, tz: Option<&Tz>) -> Result<DateTime<Utc>, ClickHouseSourceError> {
+        let seconds = self.read_u32()? as i64;
+        chrono::DateTime::from_timestamp(seconds, 0)
+            .map(|dt| dt.with_timezone(tz.unwrap_or(&Tz::UTC)).to_utc())
+            .ok_or_else(|| {
+                anyhow!("Invalid datetime value: {} seconds since epoch", seconds).into()
+            })
+    }
+
+    fn read_datetime64(
+        &mut self,
+        precision: u8,
+        tz: Option<&Tz>,
+    ) -> Result<DateTime<Utc>, ClickHouseSourceError> {
+        let ticks = self.read_i64()?;
+        let (seconds, nanos) = match precision {
+            0 => (ticks, 0u32),
+            1 => (ticks / 10, ((ticks % 10) * 100_000_000) as u32),
+            2 => (ticks / 100, ((ticks % 100) * 10_000_000) as u32),
+            3 => (ticks / 1_000, ((ticks % 1_000) * 1_000_000) as u32),
+            4 => (ticks / 10_000, ((ticks % 10_000) * 100_000) as u32),
+            5 => (ticks / 100_000, ((ticks % 100_000) * 10_000) as u32),
+            6 => (ticks / 1_000_000, ((ticks % 1_000_000) * 1_000) as u32),
+            7 => (ticks / 10_000_000, ((ticks % 10_000_000) * 100) as u32),
+            8 => (ticks / 100_000_000, ((ticks % 100_000_000) * 10) as u32),
+            9 => (ticks / 1_000_000_000, (ticks % 1_000_000_000) as u32),
+            _ => return Err(anyhow!("Unsupported DateTime64 precision: {}", precision).into()),
+        };
+        chrono::DateTime::from_timestamp(seconds, nanos)
+            .map(|dt| dt.with_timezone(tz.unwrap_or(&Tz::UTC)).to_utc())
+            .ok_or_else(|| anyhow!("Invalid datetime64 value").into())
+    }
+
+    fn read_decimal32(&mut self, scale: u8) -> Result<Decimal, ClickHouseSourceError> {
+        let raw = self.read_i32()?;
+        let mut dec = Decimal::from(raw);
+        dec.set_scale(scale as u32)
+            .map_err(|e| anyhow!("Failed to set decimal scale: {}", e))?;
+        Ok(dec)
+    }
+
+    fn read_decimal64(&mut self, scale: u8) -> Result<Decimal, ClickHouseSourceError> {
+        let raw = self.read_i64()?;
+        let mut dec = Decimal::from(raw);
+        dec.set_scale(scale as u32)
+            .map_err(|e| anyhow!("Failed to set decimal scale: {}", e))?;
+        Ok(dec)
+    }
+
+    fn read_time(&mut self) -> Result<NaiveTime, ClickHouseSourceError> {
+        let seconds = self.read_u32()? as i64;
+        Ok(
+            NaiveTime::from_num_seconds_from_midnight_opt(seconds as u32, 0)
+                .ok_or_else(|| anyhow!("Invalid time value: {} seconds since midnight", seconds))?,
+        )
+    }
+
+    fn read_time64(&mut self) -> Result<NaiveTime, ClickHouseSourceError> {
+        let microseconds = self.read_i64()?;
+        Ok(NaiveTime::from_num_seconds_from_midnight_opt(
+            (microseconds / 1_000_000) as u32,
+            ((microseconds % 1_000_000) * 1_000) as u32,
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "Invalid time64 value: {} microseconds since midnight",
+                microseconds
+            )
+        })?)
+    }
+
+    fn read_ipv4(&mut self) -> Result<IpAddr, ClickHouseSourceError> {
+        let mut buf = [0u8; 4];
+        self.cursor
+            .read_exact(&mut buf)
+            .map_err(|e| anyhow!("Failed to read IPv4: {}", e))?;
+        Ok(IpAddr::V4(Ipv4Addr::from(buf)))
+    }
+
+    fn read_ipv6(&mut self) -> Result<IpAddr, ClickHouseSourceError> {
+        let mut buf = [0u8; 16];
+        self.cursor
+            .read_exact(&mut buf)
+            .map_err(|e| anyhow!("Failed to read IPv6: {}", e))?;
+        Ok(IpAddr::V6(Ipv6Addr::from(buf)))
+    }
+
+    fn read_enum8(&mut self) -> Result<i8, ClickHouseSourceError> {
+        self.read_i8()
+    }
+
+    fn read_enum16(&mut self) -> Result<i16, ClickHouseSourceError> {
+        self.read_i16()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.cursor.position() as usize >= self.cursor.get_ref().len()
+    }
+}
+
+pub struct ClickHouseSourceParser<'a> {
+    rt: Arc<Runtime>,
+    client: Client,
+    query: CXQuery<String>,
+    schema: Vec<ClickHouseTypeSystem>,
+    metadata: Vec<TypeMetadata>,
+    rowbuf: Vec<Vec<DataType>>,
+    ncols: usize,
+    current_row: usize,
+    current_col: usize,
+    is_finished: bool,
+    _phantom: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> ClickHouseSourceParser<'a> {
+    #[throws(ClickHouseSourceError)]
+    pub fn new(
+        rt: Arc<Runtime>,
+        client: Client,
+        query: CXQuery<String>,
+        schema: &[ClickHouseTypeSystem],
+        metadata: &[TypeMetadata],
+    ) -> Self {
+        Self {
+            rt,
+            client,
+            query,
+            schema: schema.to_vec(),
+            metadata: metadata.to_vec(),
+            rowbuf: Vec::new(),
+            ncols: schema.len(),
+            current_row: 0,
+            current_col: 0,
+            is_finished: false,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    fn parse_row_binary(
+        &self,
+        reader: &mut BinaryReader,
+    ) -> Result<Vec<DataType>, ClickHouseSourceError> {
+        let mut row = Vec::with_capacity(self.ncols);
+
+        for (col_idx, col_type) in self.schema.iter().enumerate() {
+            let is_nullable = col_type.is_nullable();
+            let meta = &self.metadata[col_idx];
+
+            if is_nullable {
+                let null_flag = reader.read_u8()?;
+                if null_flag == 1 {
+                    row.push(DataType::Null);
+                    continue;
+                }
+            }
+
+            let value = match col_type {
+                ClickHouseTypeSystem::Int8(_) => DataType::Int8(reader.read_i8()?),
+                ClickHouseTypeSystem::Int16(_) => DataType::Int16(reader.read_i16()?),
+                ClickHouseTypeSystem::Int32(_) => DataType::Int32(reader.read_i32()?),
+                ClickHouseTypeSystem::Int64(_) => DataType::Int64(reader.read_i64()?),
+                ClickHouseTypeSystem::UInt8(_) => DataType::UInt8(reader.read_u8()?),
+                ClickHouseTypeSystem::UInt16(_) => DataType::UInt16(reader.read_u16()?),
+                ClickHouseTypeSystem::UInt32(_) => DataType::UInt32(reader.read_u32()?),
+                ClickHouseTypeSystem::UInt64(_) => DataType::UInt64(reader.read_u64()?),
+
+                ClickHouseTypeSystem::Float32(_) => DataType::Float32(reader.read_f32()?),
+                ClickHouseTypeSystem::Float64(_) => DataType::Float64(reader.read_f64()?),
+
+                ClickHouseTypeSystem::Decimal32(_) => {
+                    DataType::Decimal32(reader.read_decimal32(meta.scale)?)
+                }
+                ClickHouseTypeSystem::Decimal64(_) => {
+                    DataType::Decimal64(reader.read_decimal64(meta.scale)?)
+                }
+
+                ClickHouseTypeSystem::String(_) => DataType::String(reader.read_string()?),
+
+                ClickHouseTypeSystem::FixedString(_) => {
+                    DataType::FixedString(reader.read_fixed_string(meta.length)?)
+                }
+
+                ClickHouseTypeSystem::Date(_) => DataType::Date(reader.read_date()?),
+                ClickHouseTypeSystem::Date32(_) => DataType::Date32(reader.read_date32()?),
+
+                ClickHouseTypeSystem::DateTime(_) => {
+                    DataType::DateTime(reader.read_datetime(meta.timezone.as_ref())?)
+                }
+                ClickHouseTypeSystem::DateTime64(_) => DataType::DateTime64(
+                    reader.read_datetime64(meta.precision, meta.timezone.as_ref())?,
+                ),
+
+                ClickHouseTypeSystem::Time(_) => DataType::Time(reader.read_time()?),
+                ClickHouseTypeSystem::Time64(_) => DataType::Time64(reader.read_time64()?),
+
+                ClickHouseTypeSystem::Enum8(_) => DataType::Enum8(reader.read_enum8()?),
+                ClickHouseTypeSystem::Enum16(_) => DataType::Enum16(reader.read_enum16()?),
+
+                ClickHouseTypeSystem::UUID(_) => DataType::UUID(reader.read_uuid()?),
+
+                ClickHouseTypeSystem::IPv4(_) => DataType::IPv4(reader.read_ipv4()?),
+                ClickHouseTypeSystem::IPv6(_) => DataType::IPv6(reader.read_ipv6()?),
+
+                ClickHouseTypeSystem::Bool(_) => DataType::Bool(reader.read_bool()?),
+
+                _ => DataType::Null, // For unsupported types, we can choose to return Null or throw an error. Here we choose Null for simplicity.
+            };
+
+            row.push(value);
+        }
+
+        Ok(row)
+    }
+
+    #[throws(ClickHouseSourceError)]
+    fn next_loc(&mut self) -> (usize, usize) {
+        let ret = (self.current_row, self.current_col);
+        self.current_row += (self.current_col + 1) / self.ncols;
+        self.current_col = (self.current_col + 1) % self.ncols;
+        ret
+    }
+}
+
+impl<'a> PartitionParser<'a> for ClickHouseSourceParser<'a> {
+    type TypeSystem = ClickHouseTypeSystem;
+    type Error = ClickHouseSourceError;
+
+    #[throws(ClickHouseSourceError)]
+    fn fetch_next(&mut self) -> (usize, bool) {
+        assert!(self.current_col == 0);
+
+        if self.is_finished {
+            return (0, true);
+        }
+
+        let response = self.rt.block_on(async {
+            let mut cursor = self
+                .client
+                .query(self.query.as_str())
+                .fetch_bytes("RowBinary")
+                .map_err(|e| anyhow!("ClickHouse error: {}", e))?;
+            let bytes = cursor
+                .collect()
+                .await
+                .map_err(|e| anyhow!("ClickHouse error: {}", e))?;
+            Ok::<_, ClickHouseSourceError>(bytes)
+        })?;
+        let mut reader = BinaryReader::new(&response);
+        let mut rows = Vec::new();
+
+        while !reader.is_empty() {
+            match self.parse_row_binary(&mut reader) {
+                Ok(row) => rows.push(row),
+                Err(_) => break,
+            }
+        }
+
+        self.rowbuf = rows;
+        self.current_row = 0;
+        self.is_finished = true;
+
+        (self.rowbuf.len(), true)
+    }
+}
+
+macro_rules! impl_produce {
+    ($rust_type:ty, [$($variant:ident),+]) => {
+        impl<'r, 'a> Produce<'r, $rust_type> for ClickHouseSourceParser<'a> {
+            type Error = ClickHouseSourceError;
+
+            #[throws(ClickHouseSourceError)]
+            fn produce(&'r mut self) -> $rust_type {
+                let (ridx, cidx) = self.next_loc()?;
+                let value = &self.rowbuf[ridx][cidx];
+
+                match value {
+                    $(DataType::$variant(v) => *v as $rust_type,)+
+                    _ => throw!(ConnectorXError::cannot_produce::<$rust_type>(Some(
+                        format!("{:?}", value)
+                    ))),
+                }
+            }
+        }
+
+        impl<'r, 'a> Produce<'r, Option<$rust_type>> for ClickHouseSourceParser<'a> {
+            type Error = ClickHouseSourceError;
+
+            #[throws(ClickHouseSourceError)]
+            fn produce(&'r mut self) -> Option<$rust_type> {
+                let (ridx, cidx) = self.next_loc()?;
+                let value = &self.rowbuf[ridx][cidx];
+
+                match value {
+                    DataType::Null => None,
+                    $(DataType::$variant(v) => Some(*v as $rust_type),)+
+                    _ => throw!(ConnectorXError::cannot_produce::<$rust_type>(Some(
+                        format!("{:?}", value)
+                    ))),
+                }
+            }
+        }
+    };
+}
+
+macro_rules! impl_produce_with_clone {
+    ($rust_type:ty, [$($variant:ident),+]) => {
+        impl<'r, 'a> Produce<'r, $rust_type> for ClickHouseSourceParser<'a> {
+            type Error = ClickHouseSourceError;
+
+            #[throws(ClickHouseSourceError)]
+            fn produce(&'r mut self) -> $rust_type {
+                let (ridx, cidx) = self.next_loc()?;
+                let value = &self.rowbuf[ridx][cidx];
+
+                match value {
+                    $(DataType::$variant(v) => v.clone() as $rust_type,)+
+                    _ => throw!(ConnectorXError::cannot_produce::<$rust_type>(Some(
+                        format!("{:?}", value)
+                    ))),
+                }
+            }
+        }
+
+        impl<'r, 'a> Produce<'r, Option<$rust_type>> for ClickHouseSourceParser<'a> {
+            type Error = ClickHouseSourceError;
+
+            #[throws(ClickHouseSourceError)]
+            fn produce(&'r mut self) -> Option<$rust_type> {
+                let (ridx, cidx) = self.next_loc()?;
+                let value = &self.rowbuf[ridx][cidx];
+
+                match value {
+                    DataType::Null => None,
+                    $(DataType::$variant(v) => Some(v.clone() as $rust_type),)+
+                    _ => throw!(ConnectorXError::cannot_produce::<$rust_type>(Some(
+                        format!("{:?}", value)
+                    ))),
+                }
+            }
+        }
+    };
+}
+
+macro_rules! impl_produce_vec {
+    ($rust_type:ty, [$($variant:ident),+]) => {
+        impl<'r, 'a> Produce<'r, Vec<Option<$rust_type>>> for ClickHouseSourceParser<'a> {
+            type Error = ClickHouseSourceError;
+
+            #[throws(ClickHouseSourceError)]
+            fn produce(&'r mut self) -> Vec<Option<$rust_type>> {
+                let (ridx, cidx) = self.next_loc()?;
+                let value = &self.rowbuf[ridx][cidx];
+
+                match value {
+                    $(DataType::$variant(v) => v.clone(),)+
+                    _ => throw!(ConnectorXError::cannot_produce::<Vec<Option<$rust_type>>>(Some(
+                        format!("{:?}", value)
+                    ))),
+                }
+            }
+        }
+
+        impl<'r, 'a> Produce<'r, Option<Vec<Option<$rust_type>>>> for ClickHouseSourceParser<'a> {
+            type Error = ClickHouseSourceError;
+
+            #[throws(ClickHouseSourceError)]
+            fn produce(&'r mut self) -> Option<Vec<Option<$rust_type>>> {
+                let (ridx, cidx) = self.next_loc()?;
+                let value = &self.rowbuf[ridx][cidx];
+
+                match value {
+                    DataType::Null => None,
+                    $(DataType::$variant(v) => Some(v.clone()),)+
+                    _ => throw!(ConnectorXError::cannot_produce::<Option<Vec<Option<$rust_type>>>>(Some(
+                        format!("{:?}", value)
+                    ))),
+                }
+            }
+        }
+    };
+}
+
+impl_produce!(i8, [Int8, Enum8]);
+impl_produce!(i16, [Int16, Enum16]);
+impl_produce!(i32, [Int32]);
+impl_produce!(i64, [Int64]);
+impl_produce!(u8, [UInt8]);
+impl_produce!(u16, [UInt16]);
+impl_produce!(u32, [UInt32]);
+impl_produce!(u64, [UInt64]);
+impl_produce!(f32, [Float32]);
+impl_produce!(f64, [Float64]);
+impl_produce!(Decimal, [Decimal32, Decimal64]);
+impl_produce_with_clone!(String, [String]);
+impl_produce_with_clone!(Vec<u8>, [FixedString]);
+impl_produce!(NaiveDate, [Date, Date32]);
+impl_produce!(DateTime<Utc>, [DateTime, DateTime64]);
+impl_produce!(NaiveTime, [Time, Time64]);
+impl_produce!(Uuid, [UUID]);
+impl_produce!(IpAddr, [IPv4, IPv6]);
+impl_produce!(bool, [Bool]);
+impl_produce_vec!(bool, [ArrayBool]);
+impl_produce_vec!(String, [ArrayString]);
+impl_produce_vec!(i8, [ArrayInt8]);
+impl_produce_vec!(i16, [ArrayInt16]);
+impl_produce_vec!(i32, [ArrayInt32]);
+impl_produce_vec!(i64, [ArrayInt64]);
+impl_produce_vec!(u8, [ArrayUInt8]);
+impl_produce_vec!(u16, [ArrayUInt16]);
+impl_produce_vec!(u32, [ArrayUInt32]);
+impl_produce_vec!(u64, [ArrayUInt64]);
+impl_produce_vec!(f32, [ArrayFloat32]);
+impl_produce_vec!(f64, [ArrayFloat64]);
+impl_produce_vec!(Decimal, [ArrayDecimal32, ArrayDecimal64]);

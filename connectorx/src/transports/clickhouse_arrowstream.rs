@@ -54,8 +54,8 @@ impl_transport!(
         { String[String]             => LargeUtf8[String]                       | conversion auto }
         { FixedString[Vec<u8>]       => LargeBinary[Vec<u8>]                    | conversion auto }
 
-        { Enum8[i8]                  => Int16[i16]                              | conversion none }
-        { Enum16[i16]                => Int16[i16]                              | conversion none }
+        { Enum8[String]              => LargeUtf8[String]                       | conversion none }
+        { Enum16[String]             => LargeUtf8[String]                       | conversion none }
 
         { Date[NaiveDate]            => Date32[NaiveDate]                       | conversion auto }
         { Date32[NaiveDate]          => Date32[NaiveDate]                       | conversion none }

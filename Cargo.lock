@@ -1156,6 +1156,7 @@ dependencies = [
  "rusqlite",
  "rust_decimal",
  "rust_decimal_macros",
+ "rustc-hash 2.1.1",
  "serde",
  "serde_json",
  "sqlparser 0.37.0",

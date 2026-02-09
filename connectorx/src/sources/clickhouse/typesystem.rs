@@ -5,6 +5,7 @@ use chrono_tz::Tz;
 use regex::Regex;
 use rust_decimal::Decimal;
 use uuid::Uuid;
+use rustc_hash::FxHashMap;
 
 #[derive(Clone, Debug)]
 pub enum DataType {
@@ -28,8 +29,8 @@ pub enum DataType {
     Time64(NaiveTime),
     DateTime(DateTime<Utc>),
     DateTime64(DateTime<Utc>),
-    Enum8(i8),
-    Enum16(i16),
+    Enum8(String),
+    Enum16(String),
     UUID(Uuid),
     IPv4(IpAddr),
     IPv6(IpAddr),
@@ -106,7 +107,7 @@ pub struct TypeMetadata {
     /// DateTime, DateTime64
     pub timezone: Option<Tz>,
     /// Enum8, Enum16
-    pub named_values: Option<Vec<(String, i16)>>,
+    pub named_values: Option<FxHashMap<i16, String>>,
     /// FixedString
     pub length: usize,
 }
@@ -114,8 +115,8 @@ pub struct TypeMetadata {
 impl_typesystem! {
     system = ClickHouseTypeSystem,
     mappings = {
-        { Int8 | Enum8 => i8 }
-        { Int16 | Enum16 => i16 }
+        { Int8 => i8 }
+        { Int16 => i16 }
         { Int32 => i32 }
         { Int64 => i64 }
         { UInt8 => u8 }
@@ -125,7 +126,7 @@ impl_typesystem! {
         { Float32 => f32 }
         { Float64 => f64 }
         { Decimal32 | Decimal64 => Decimal }
-        { String => String }
+        { String | Enum8 | Enum16 => String }
         { FixedString => Vec<u8> }
         { Date | Date32 => NaiveDate }
         { Time | Time64 => NaiveTime }
@@ -222,6 +223,18 @@ impl ClickHouseTypeSystem {
             "Bool" => Bool(nullable),
             "IPv4" => IPv4(nullable),
             "IPv6" => IPv6(nullable),
+            "Enum8" => {
+                if let Some(params) = params {
+                    metadata.named_values = Self::parse_enum_definition(params);
+                }
+                Enum8(nullable)
+            }
+            "Enum16" => {
+                if let Some(params) = params {
+                    metadata.named_values = Self::parse_enum_definition(params);
+                }
+                Enum16(nullable)
+            }
             _ => String(nullable),
         };
 
@@ -250,14 +263,11 @@ impl ClickHouseTypeSystem {
         }
     }
 
-    fn split_type_params(s: &str) -> (&str, Option<Vec<&str>>) {
+    fn split_type_params(s: &str) -> (&str, Option<&str>) {
         if let Some(idx) = s.find('(') {
             if s.ends_with(')') {
                 let base = &s[..idx];
-                let params_str = s[idx + 1..s.len() - 1]
-                    .split(',')
-                    .map(|i| i.trim())
-                    .collect::<Vec<_>>();
+                let params_str = &s[idx + 1..s.len() - 1];
                 return (base, Some(params_str));
             }
         }
@@ -265,14 +275,16 @@ impl ClickHouseTypeSystem {
     }
 
     /// Parse FixedString(N)
-    fn parse_length(params: Option<Vec<&str>>) -> usize {
+    fn parse_length(params: Option<&str>) -> usize {
+        let params = params.and_then(|p| p.split(',').map(|i| i.trim()).collect::<Vec<_>>().into());
         params
             .and_then(|p| p.get(0).and_then(|s| s.parse::<usize>().ok()))
             .unwrap_or(1)
     }
 
     /// Parse DateTime(precision, 'Timezone') or DateTime('Timezone')
-    fn parse_datetime_params(params: Option<Vec<&str>>) -> (Option<u8>, Option<Tz>) {
+    fn parse_datetime_params(params: Option<&str>) -> (Option<u8>, Option<Tz>) {
+        let params = params.and_then(|p| p.split(',').map(|i| i.trim()).collect::<Vec<_>>().into());
         match params {
             None => (None, None),
             Some(p) => {
@@ -287,7 +299,8 @@ impl ClickHouseTypeSystem {
     }
 
     /// Parse Decimal(precision, scale) or DecimalX(scale)
-    fn parse_decimal_scale(params: Option<Vec<&str>>) -> u8 {
+    fn parse_decimal_scale(params: Option<&str>) -> u8 {
+        let params = params.and_then(|p| p.split(',').map(|i| i.trim()).collect::<Vec<_>>().into());
         params
             .and_then(|p| {
                 if p.len() >= 2 {
@@ -337,16 +350,16 @@ impl ClickHouseTypeSystem {
     }
 
     /// Parse Enum8/Enum16 definitions like "'a' = 1, 'b' = 2, 'c' = 3"
-    fn parse_enum_definition(params: &str) -> Option<Vec<(String, i16)>> {
+    fn parse_enum_definition(params: &str) -> Option<FxHashMap<i16, String>> {
         let re = Regex::new(r"'((?:\\'|[^'])*)'\s*=\s*(-?\d+)").unwrap();
 
         re.captures_iter(params)
             .map(|cap| {
                 let key = cap[1].replace("\\'", "'");
                 let value = cap[2].parse().unwrap();
-                (key, value)
+                (value, key)
             })
-            .collect::<Vec<_>>()
+            .collect::<FxHashMap<_, _>>()
             .into()
     }
 

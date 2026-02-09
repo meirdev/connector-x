@@ -645,8 +645,16 @@ impl<'a> ClickHouseSourceParser<'a> {
                 ClickHouseTypeSystem::Time(_) => DataType::Time(reader.read_time()?),
                 ClickHouseTypeSystem::Time64(_) => DataType::Time64(reader.read_time64()?),
 
-                ClickHouseTypeSystem::Enum8(_) => DataType::Enum8(reader.read_enum8()?),
-                ClickHouseTypeSystem::Enum16(_) => DataType::Enum16(reader.read_enum16()?),
+                ClickHouseTypeSystem::Enum8(_) => {
+                    let enum_value = reader.read_enum8()?;
+                    let enum_str = meta.named_values.as_ref().and_then(|h| h.get(&(enum_value as i16)));
+                    DataType::Enum8(enum_str.cloned().unwrap_or_default())
+                }
+                ClickHouseTypeSystem::Enum16(_) => {
+                    let enum_value = reader.read_enum16()?;
+                    let enum_str = meta.named_values.as_ref().and_then(|h| h.get(&enum_value));
+                    DataType::Enum16(enum_str.cloned().unwrap_or_default())
+                }
 
                 ClickHouseTypeSystem::UUID(_) => DataType::UUID(reader.read_uuid()?),
 
@@ -875,8 +883,8 @@ macro_rules! impl_produce_vec {
     };
 }
 
-impl_produce!(i8, [Int8, Enum8]);
-impl_produce!(i16, [Int16, Enum16]);
+impl_produce!(i8, [Int8]);
+impl_produce!(i16, [Int16]);
 impl_produce!(i32, [Int32]);
 impl_produce!(i64, [Int64]);
 impl_produce!(u8, [UInt8]);
@@ -886,7 +894,7 @@ impl_produce!(u64, [UInt64]);
 impl_produce!(f32, [Float32]);
 impl_produce!(f64, [Float64]);
 impl_produce!(Decimal, [Decimal32, Decimal64]);
-impl_produce_with_clone!(String, [String]);
+impl_produce_with_clone!(String, [String, Enum8, Enum16]);
 impl_produce_with_clone!(Vec<u8>, [FixedString]);
 impl_produce!(NaiveDate, [Date, Date32]);
 impl_produce!(DateTime<Utc>, [DateTime, DateTime64]);

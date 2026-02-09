@@ -460,23 +460,15 @@ impl<'a> BinaryReader<'a> {
         precision: u8,
         tz: Option<&Tz>,
     ) -> Result<DateTime<Utc>, ClickHouseSourceError> {
+        if precision > 9 {
+            return Err(anyhow!("Unsupported DateTime64 precision: {}", precision).into());
+        }
         let ticks = self.read_i64()?;
-        let (seconds, nanos) = match precision {
-            0 => (ticks, 0u32),
-            1 => (ticks / 10, ((ticks % 10) * 100_000_000) as u32),
-            2 => (ticks / 100, ((ticks % 100) * 10_000_000) as u32),
-            3 => (ticks / 1_000, ((ticks % 1_000) * 1_000_000) as u32),
-            4 => (ticks / 10_000, ((ticks % 10_000) * 100_000) as u32),
-            5 => (ticks / 100_000, ((ticks % 100_000) * 10_000) as u32),
-            6 => (ticks / 1_000_000, ((ticks % 1_000_000) * 1_000) as u32),
-            7 => (ticks / 10_000_000, ((ticks % 10_000_000) * 100) as u32),
-            8 => (ticks / 100_000_000, ((ticks % 100_000_000) * 10) as u32),
-            9 => (ticks / 1_000_000_000, (ticks % 1_000_000_000) as u32),
-            _ => return Err(anyhow!("Unsupported DateTime64 precision: {}", precision).into()),
-        };
-        chrono::DateTime::from_timestamp(seconds, nanos)
-            .map(|dt| dt.with_timezone(tz.unwrap_or(&Tz::UTC)).to_utc())
-            .ok_or_else(|| anyhow!("Invalid datetime64 value").into())
+        let nanos = ticks * 10_i64.pow(9 - precision as u32);
+
+        Ok(DateTime::from_timestamp_nanos(nanos)
+            .with_timezone(tz.unwrap_or(&Tz::UTC))
+            .to_utc())
     }
 
     fn read_decimal<T, F>(

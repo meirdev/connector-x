@@ -398,6 +398,14 @@ impl<'a> BinaryReader<'a> {
         Ok(result)
     }
 
+    fn read_fixed_string(&mut self, len: usize) -> Result<Vec<u8>, ClickHouseSourceError> {
+        let mut buf = vec![0u8; len];
+        self.cursor
+            .read_exact(&mut buf)
+            .map_err(|e| anyhow!("Failed to read FixedString: {}", e))?;
+        Ok(buf)
+    }
+
     fn read_string(&mut self) -> Result<String, ClickHouseSourceError> {
         let len = self.read_varint()? as usize;
         let mut buf = vec![0u8; len];
@@ -419,15 +427,8 @@ impl<'a> BinaryReader<'a> {
         Ok(self.read_u8()? != 0)
     }
 
-    fn read_fixed_string(&mut self, len: usize) -> Result<Vec<u8>, ClickHouseSourceError> {
-        let mut buf = vec![0u8; len];
-        self.cursor
-            .read_exact(&mut buf)
-            .map_err(|e| anyhow!("Failed to read FixedString: {}", e))?;
-        Ok(buf)
-    }
-
     fn read_date(&mut self) -> Result<NaiveDate, ClickHouseSourceError> {
+        // ClickHouse stores Date as UInt16 representing days since 1970-01-01
         let days = self.read_u16()? as i64;
         let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         epoch
@@ -436,6 +437,8 @@ impl<'a> BinaryReader<'a> {
     }
 
     fn read_date32(&mut self) -> Result<NaiveDate, ClickHouseSourceError> {
+        // ClickHouse stores Date32 as Int32 representing days since 1970-01-01
+        // negative values represent dates before 1970-01-01
         let days = self.read_i32()? as i64;
         let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         epoch

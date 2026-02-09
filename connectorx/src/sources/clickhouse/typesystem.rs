@@ -232,7 +232,6 @@ impl ClickHouseTypeSystem {
         Self::from_type_str_with_metadata(type_str).0
     }
 
-    /// Unwrap Nullable(X) -> (X, true) or (X, false)
     fn unwrap_nullable(s: &str) -> (&str, bool) {
         if let Some(inner) = Self::unwrap_wrapper(s, "Nullable") {
             (inner, true)
@@ -251,65 +250,57 @@ impl ClickHouseTypeSystem {
         }
     }
 
-    /// Split "Type(params)" into ("Type", Some("params"))
-    fn split_type_params(s: &str) -> (&str, Option<&str>) {
+    fn split_type_params(s: &str) -> (&str, Option<Vec<&str>>) {
         if let Some(idx) = s.find('(') {
             if s.ends_with(')') {
                 let base = &s[..idx];
-                let params_str = &s[idx + 1..s.len() - 1];
+                let params_str = s[idx + 1..s.len() - 1]
+                    .split(',')
+                    .map(|i| i.trim())
+                    .collect::<Vec<_>>();
                 return (base, Some(params_str));
             }
         }
         (s, None)
     }
 
-    /// Parse FixedString length parameter
-    fn parse_length(params: Option<&str>) -> usize {
+    /// Parse FixedString(N)
+    fn parse_length(params: Option<Vec<&str>>) -> usize {
         params
-            .and_then(|p| p.trim().parse::<usize>().ok())
+            .and_then(|p| p.get(0).and_then(|s| s.parse::<usize>().ok()))
             .unwrap_or(1)
     }
 
-    /// Parse DateTime/DateTime64 parameters -> (Option<precision>, Option<timezone>)
-    fn parse_datetime_params(params: Option<&str>) -> (Option<u8>, Option<Tz>) {
+    /// Parse DateTime(precision, 'Timezone') or DateTime('Timezone')
+    fn parse_datetime_params(params: Option<Vec<&str>>) -> (Option<u8>, Option<Tz>) {
         match params {
             None => (None, None),
             Some(p) => {
-                let parts: Vec<&str> = p.splitn(2, ',').collect();
-                let first = parts[0].trim();
-
-                // Check if first part is a number (precision) or timezone
-                if let Ok(precision) = first.parse::<u8>() {
-                    let timezone = parts.get(1).and_then(|s| Self::parse_timezone(s));
+                if let Some(precision) = p.get(0).and_then(|s| s.parse::<u8>().ok()) {
+                    let timezone = p.get(1).and_then(|s| Self::parse_timezone(s));
                     (Some(precision), timezone)
                 } else {
-                    // First part is timezone (DateTime case)
-                    (None, Self::parse_timezone(first))
+                    (None, p.get(0).and_then(|s| Self::parse_timezone(s)))
                 }
             }
         }
     }
 
-    fn parse_decimal_scale(params: Option<&str>) -> u8 {
+    /// Parse Decimal(precision, scale) or DecimalX(scale)
+    fn parse_decimal_scale(params: Option<Vec<&str>>) -> u8 {
         params
             .and_then(|p| {
-                let parts: Vec<&str> = p.split(',').collect();
-                if parts.len() >= 2 {
-                    parts[1].trim().parse::<u8>().ok()
+                if p.len() >= 2 {
+                    p.get(1).and_then(|s| s.parse::<u8>().ok())
                 } else {
-                    parts[0].trim().parse::<u8>().ok()
+                    p.get(0).and_then(|s| s.parse::<u8>().ok())
                 }
             })
             .unwrap_or(0)
     }
 
     fn parse_timezone(s: &str) -> Option<Tz> {
-        let s = s.trim();
-        if s.starts_with('\'') && s.ends_with('\'') && s.len() > 2 {
-            s[1..s.len() - 1].parse::<Tz>().ok()
-        } else {
-            None
-        }
+        s.trim_matches('\'').parse::<Tz>().ok()
     }
 
     /// Parse Array(InnerType) and return the corresponding ArrayXxx variant

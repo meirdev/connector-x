@@ -48,8 +48,7 @@ impl_transport!(
         { Float32[f32]               => Float32[f32]                            | conversion auto }
         { Float64[f64]               => Float64[f64]                            | conversion auto }
 
-        { Decimal32[Decimal]         => Decimal[Decimal]                        | conversion auto }
-        { Decimal64[Decimal]         => Decimal[Decimal]                        | conversion none }
+        { Decimal[Decimal]           => Decimal[Decimal]                        | conversion auto }
 
         { String[String]             => LargeUtf8[String]                       | conversion auto }
         { FixedString[Vec<u8>]       => LargeBinary[Vec<u8>]                    | conversion auto }
@@ -69,18 +68,19 @@ impl_transport!(
         { IPv6[IpAddr]               => LargeUtf8[String]                       | conversion none }
         { Bool[bool]                 => Boolean[bool]                           | conversion auto }
 
-        { ArrayBool[Vec<Option<bool>>]      => BoolArray[Vec<Option<bool>>]           | conversion auto }
-        { ArrayString[Vec<Option<String>>]  => Utf8Array[Vec<Option<String>>]         | conversion auto }
-        { ArrayInt8[Vec<Option<i8>>]        => Int16Array[Vec<Option<i16>>]           | conversion none }
-        { ArrayInt16[Vec<Option<i16>>]      => Int16Array[Vec<Option<i16>>]           | conversion auto }
-        { ArrayInt32[Vec<Option<i32>>]      => Int32Array[Vec<Option<i32>>]           | conversion auto }
-        { ArrayInt64[Vec<Option<i64>>]      => Int64Array[Vec<Option<i64>>]           | conversion auto }
-        { ArrayUInt8[Vec<Option<u8>>]       => UInt16Array[Vec<Option<u16>>]          | conversion none }
-        { ArrayUInt16[Vec<Option<u16>>]     => UInt16Array[Vec<Option<u16>>]          | conversion auto }
-        { ArrayUInt32[Vec<Option<u32>>]     => UInt32Array[Vec<Option<u32>>]          | conversion auto }
-        { ArrayUInt64[Vec<Option<u64>>]     => UInt64Array[Vec<Option<u64>>]          | conversion auto }
-        { ArrayFloat32[Vec<Option<f32>>]    => Float32Array[Vec<Option<f32>>]         | conversion auto }
-        { ArrayFloat64[Vec<Option<f64>>]    => Float64Array[Vec<Option<f64>>]         | conversion auto }
+        { ArrayBool[Vec<Option<bool>>]         => BoolArray[Vec<Option<bool>>]           | conversion auto }
+        { ArrayString[Vec<Option<String>>]     => Utf8Array[Vec<Option<String>>]         | conversion auto }
+        { ArrayInt8[Vec<Option<i8>>]           => Int16Array[Vec<Option<i16>>]           | conversion none }
+        { ArrayInt16[Vec<Option<i16>>]         => Int16Array[Vec<Option<i16>>]           | conversion auto }
+        { ArrayInt32[Vec<Option<i32>>]         => Int32Array[Vec<Option<i32>>]           | conversion auto }
+        { ArrayInt64[Vec<Option<i64>>]         => Int64Array[Vec<Option<i64>>]           | conversion auto }
+        { ArrayUInt8[Vec<Option<u8>>]          => UInt16Array[Vec<Option<u16>>]          | conversion none }
+        { ArrayUInt16[Vec<Option<u16>>]        => UInt16Array[Vec<Option<u16>>]          | conversion auto }
+        { ArrayUInt32[Vec<Option<u32>>]        => UInt32Array[Vec<Option<u32>>]          | conversion auto }
+        { ArrayUInt64[Vec<Option<u64>>]        => UInt64Array[Vec<Option<u64>>]          | conversion auto }
+        { ArrayFloat32[Vec<Option<f32>>]       => Float32Array[Vec<Option<f32>>]         | conversion auto }
+        { ArrayFloat64[Vec<Option<f64>>]       => Float64Array[Vec<Option<f64>>]         | conversion auto }
+        { ArrayDecimal[Vec<Option<Decimal>>]   => DecimalArray[Vec<Option<Decimal>>]     | conversion auto }
     }
 );
 

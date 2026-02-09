@@ -4,8 +4,8 @@ use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
 use regex::Regex;
 use rust_decimal::Decimal;
-use uuid::Uuid;
 use rustc_hash::FxHashMap;
+use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 pub enum DataType {
@@ -19,8 +19,7 @@ pub enum DataType {
     UInt64(u64),
     Float32(f32),
     Float64(f64),
-    Decimal32(Decimal),
-    Decimal64(Decimal),
+    Decimal(Decimal),
     String(String),
     FixedString(Vec<u8>),
     Date(NaiveDate),
@@ -48,8 +47,7 @@ pub enum DataType {
     ArrayUInt64(Vec<Option<u64>>),
     ArrayFloat32(Vec<Option<f32>>),
     ArrayFloat64(Vec<Option<f64>>),
-    ArrayDecimal32(Vec<Option<Decimal>>),
-    ArrayDecimal64(Vec<Option<Decimal>>),
+    ArrayDecimal(Vec<Option<Decimal>>),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -64,8 +62,7 @@ pub enum ClickHouseTypeSystem {
     UInt64(bool),
     Float32(bool),
     Float64(bool),
-    Decimal32(bool),
-    Decimal64(bool),
+    Decimal(bool),
     String(bool),
     FixedString(bool),
     Date(bool),
@@ -94,8 +91,7 @@ pub enum ClickHouseTypeSystem {
     ArrayUInt64(bool),
     ArrayFloat32(bool),
     ArrayFloat64(bool),
-    ArrayDecimal32(bool),
-    ArrayDecimal64(bool),
+    ArrayDecimal(bool),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -125,7 +121,7 @@ impl_typesystem! {
         { UInt64 => u64 }
         { Float32 => f32 }
         { Float64 => f64 }
-        { Decimal32 | Decimal64 => Decimal }
+        { Decimal => Decimal }
         { String | Enum8 | Enum16 => String }
         { FixedString => Vec<u8> }
         { Date | Date32 => NaiveDate }
@@ -146,7 +142,7 @@ impl_typesystem! {
         { ArrayUInt64 => Vec<Option<u64>> }
         { ArrayFloat32 => Vec<Option<f32>> }
         { ArrayFloat64 => Vec<Option<f64>> }
-        { ArrayDecimal32 | ArrayDecimal64 => Vec<Option<Decimal>> }
+        { ArrayDecimal => Vec<Option<Decimal>> }
     }
 }
 
@@ -192,13 +188,11 @@ impl ClickHouseTypeSystem {
             "UInt64" => UInt64(nullable),
             "Float32" => Float32(nullable),
             "Float64" => Float64(nullable),
-            "Decimal" | "Decimal32" => {
-                metadata.scale = Self::parse_decimal_scale(params);
-                Decimal32(nullable)
-            }
-            "Decimal64" => {
-                metadata.scale = Self::parse_decimal_scale(params);
-                Decimal64(nullable)
+            "Decimal" => {
+                let (precision, scale) = Self::parse_decimal_precision_scale(params);
+                metadata.precision = precision;
+                metadata.scale = scale;
+                Decimal(nullable)
             }
             "String" => String(nullable),
             "FixedString" => {
@@ -208,7 +202,10 @@ impl ClickHouseTypeSystem {
             "Date" => Date(nullable),
             "Date32" => Date32(nullable),
             "Time" => Time(nullable),
-            "Time64" => Time64(nullable),
+            "Time64" => {
+                metadata.precision = Self::parse_time64_precision(params);
+                Time64(nullable)
+            }
             "DateTime" => {
                 metadata.timezone = Self::parse_datetime_params(params).1;
                 DateTime(nullable)
@@ -298,18 +295,24 @@ impl ClickHouseTypeSystem {
         }
     }
 
-    /// Parse Decimal(precision, scale) or DecimalX(scale)
-    fn parse_decimal_scale(params: Option<&str>) -> u8 {
+    /// Parse Time64(precision)
+    fn parse_time64_precision(params: Option<&str>) -> u8 {
+        let params = params.and_then(|p| p.split(',').map(|i| i.trim()).collect::<Vec<_>>().into());
+        params
+            .and_then(|p| p.get(0).and_then(|s| s.parse::<u8>().ok()))
+            .unwrap_or(3)
+    }
+
+    /// Parse Decimal(precision, scale)
+    fn parse_decimal_precision_scale(params: Option<&str>) -> (u8, u8) {
         let params = params.and_then(|p| p.split(',').map(|i| i.trim()).collect::<Vec<_>>().into());
         params
             .and_then(|p| {
-                if p.len() >= 2 {
-                    p.get(1).and_then(|s| s.parse::<u8>().ok())
-                } else {
-                    p.get(0).and_then(|s| s.parse::<u8>().ok())
-                }
+                let precision = p.get(0).and_then(|s| s.parse::<u8>().ok());
+                let scale = p.get(1).and_then(|s| s.parse::<u8>().ok());
+                Some((precision.unwrap_or(0), scale.unwrap_or(0)))
             })
-            .unwrap_or(0)
+            .unwrap_or((0, 0))
     }
 
     fn parse_timezone(s: &str) -> Option<Tz> {
@@ -343,8 +346,7 @@ impl ClickHouseTypeSystem {
             "UInt64" => Some(ArrayUInt64(nullable)),
             "Float32" => Some(ArrayFloat32(nullable)),
             "Float64" => Some(ArrayFloat64(nullable)),
-            "Decimal" | "Decimal32" => Some(ArrayDecimal32(nullable)),
-            "Decimal64" => Some(ArrayDecimal64(nullable)),
+            "Decimal" => Some(ArrayDecimal(nullable)),
             _ => None,
         }
     }
@@ -375,8 +377,7 @@ impl ClickHouseTypeSystem {
             | ClickHouseTypeSystem::UInt64(nullable)
             | ClickHouseTypeSystem::Float32(nullable)
             | ClickHouseTypeSystem::Float64(nullable)
-            | ClickHouseTypeSystem::Decimal32(nullable)
-            | ClickHouseTypeSystem::Decimal64(nullable)
+            | ClickHouseTypeSystem::Decimal(nullable)
             | ClickHouseTypeSystem::String(nullable)
             | ClickHouseTypeSystem::FixedString(nullable)
             | ClickHouseTypeSystem::Date(nullable)
@@ -405,8 +406,7 @@ impl ClickHouseTypeSystem {
             | ClickHouseTypeSystem::ArrayUInt64(nullable)
             | ClickHouseTypeSystem::ArrayFloat32(nullable)
             | ClickHouseTypeSystem::ArrayFloat64(nullable)
-            | ClickHouseTypeSystem::ArrayDecimal32(nullable)
-            | ClickHouseTypeSystem::ArrayDecimal64(nullable) => *nullable,
+            | ClickHouseTypeSystem::ArrayDecimal(nullable) => *nullable,
         }
     }
 }

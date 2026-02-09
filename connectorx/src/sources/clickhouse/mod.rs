@@ -471,28 +471,18 @@ impl<'a> BinaryReader<'a> {
             .to_utc())
     }
 
-    fn read_decimal<T, F>(
-        &mut self,
-        scale: u8,
-        read_raw: F,
-    ) -> Result<Decimal, ClickHouseSourceError>
-    where
-        T: Into<Decimal>,
-        F: FnOnce(&mut Self) -> Result<T, ClickHouseSourceError>,
-    {
-        let raw = read_raw(self)?;
-        let mut dec: Decimal = raw.into();
-        dec.set_scale(scale as u32)
-            .map_err(|e| anyhow!("Failed to set decimal scale: {}", e))?;
-        Ok(dec)
-    }
-
-    fn read_decimal32(&mut self, scale: u8) -> Result<Decimal, ClickHouseSourceError> {
-        self.read_decimal(scale, Self::read_i32)
-    }
-
-    fn read_decimal64(&mut self, scale: u8) -> Result<Decimal, ClickHouseSourceError> {
-        self.read_decimal(scale, Self::read_i64)
+    fn read_decimal(&mut self, precision: u8, scale: u8) -> Result<Decimal, ClickHouseSourceError> {
+        match precision {
+            1..=9 => {
+                let value = self.read_i32()?;
+                Ok(Decimal::new(value as i64, scale as u32))
+            }
+            10..=18 => {
+                let value = self.read_i64()?;
+                Ok(Decimal::new(value, scale as u32))
+            }
+            _ => Err(anyhow!("Unsupported Decimal precision: {}", precision).into()),
+        }
     }
 
     fn read_time(&mut self) -> Result<NaiveTime, ClickHouseSourceError> {
@@ -503,18 +493,17 @@ impl<'a> BinaryReader<'a> {
         )
     }
 
-    fn read_time64(&mut self) -> Result<NaiveTime, ClickHouseSourceError> {
-        let microseconds = self.read_i64()?;
+    fn read_time64(&mut self, precision: u8) -> Result<NaiveTime, ClickHouseSourceError> {
+        if precision > 9 {
+            return Err(anyhow!("Unsupported Time64 precision: {}", precision).into());
+        }
+        let ticks = self.read_i64()?;
+        let nanos = ticks * 10_i64.pow(9 - precision as u32);
         Ok(NaiveTime::from_num_seconds_from_midnight_opt(
-            (microseconds / 1_000_000) as u32,
-            ((microseconds % 1_000_000) * 1_000) as u32,
+            (nanos / 1_000_000_000) as u32,
+            (nanos % 1_000_000_000) as u32,
         )
-        .ok_or_else(|| {
-            anyhow!(
-                "Invalid time64 value: {} microseconds since midnight",
-                microseconds
-            )
-        })?)
+        .ok_or_else(|| anyhow!("Invalid time64 value: {} ticks since midnight", ticks))?)
     }
 
     fn read_ipv4(&mut self) -> Result<IpAddr, ClickHouseSourceError> {
@@ -619,11 +608,8 @@ impl<'a> ClickHouseSourceParser<'a> {
                 ClickHouseTypeSystem::Float32(_) => DataType::Float32(reader.read_f32()?),
                 ClickHouseTypeSystem::Float64(_) => DataType::Float64(reader.read_f64()?),
 
-                ClickHouseTypeSystem::Decimal32(_) => {
-                    DataType::Decimal32(reader.read_decimal32(meta.scale)?)
-                }
-                ClickHouseTypeSystem::Decimal64(_) => {
-                    DataType::Decimal64(reader.read_decimal64(meta.scale)?)
+                ClickHouseTypeSystem::Decimal(_) => {
+                    DataType::Decimal(reader.read_decimal(meta.precision, meta.scale)?)
                 }
 
                 ClickHouseTypeSystem::String(_) => DataType::String(reader.read_string()?),
@@ -643,11 +629,16 @@ impl<'a> ClickHouseSourceParser<'a> {
                 ),
 
                 ClickHouseTypeSystem::Time(_) => DataType::Time(reader.read_time()?),
-                ClickHouseTypeSystem::Time64(_) => DataType::Time64(reader.read_time64()?),
+                ClickHouseTypeSystem::Time64(_) => {
+                    DataType::Time64(reader.read_time64(meta.precision)?)
+                }
 
                 ClickHouseTypeSystem::Enum8(_) => {
                     let enum_value = reader.read_enum8()?;
-                    let enum_str = meta.named_values.as_ref().and_then(|h| h.get(&(enum_value as i16)));
+                    let enum_str = meta
+                        .named_values
+                        .as_ref()
+                        .and_then(|h| h.get(&(enum_value as i16)));
                     DataType::Enum8(enum_str.cloned().unwrap_or_default())
                 }
                 ClickHouseTypeSystem::Enum16(_) => {
@@ -699,13 +690,10 @@ impl<'a> ClickHouseSourceParser<'a> {
                 ClickHouseTypeSystem::ArrayFloat64(_) => {
                     DataType::ArrayFloat64(reader.read_array(BinaryReader::read_f64)?)
                 }
-                ClickHouseTypeSystem::ArrayDecimal32(_) => {
+                ClickHouseTypeSystem::ArrayDecimal(_) => {
+                    let precision = meta.precision;
                     let scale = meta.scale;
-                    DataType::ArrayDecimal32(reader.read_array(|r| r.read_decimal32(scale))?)
-                }
-                ClickHouseTypeSystem::ArrayDecimal64(_) => {
-                    let scale = meta.scale;
-                    DataType::ArrayDecimal64(reader.read_array(|r| r.read_decimal64(scale))?)
+                    DataType::ArrayDecimal(reader.read_array(|r| r.read_decimal(precision, scale))?)
                 }
             };
 
@@ -893,7 +881,7 @@ impl_produce!(u32, [UInt32]);
 impl_produce!(u64, [UInt64]);
 impl_produce!(f32, [Float32]);
 impl_produce!(f64, [Float64]);
-impl_produce!(Decimal, [Decimal32, Decimal64]);
+impl_produce!(Decimal, [Decimal]);
 impl_produce_with_clone!(String, [String, Enum8, Enum16]);
 impl_produce_with_clone!(Vec<u8>, [FixedString]);
 impl_produce!(NaiveDate, [Date, Date32]);
@@ -914,4 +902,4 @@ impl_produce_vec!(u32, [ArrayUInt32]);
 impl_produce_vec!(u64, [ArrayUInt64]);
 impl_produce_vec!(f32, [ArrayFloat32]);
 impl_produce_vec!(f64, [ArrayFloat64]);
-impl_produce_vec!(Decimal, [ArrayDecimal32, ArrayDecimal64]);
+impl_produce_vec!(Decimal, [ArrayDecimal]);

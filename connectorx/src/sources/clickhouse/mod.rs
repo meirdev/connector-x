@@ -333,12 +333,16 @@ impl<'a> BinaryReader<'a> {
         }
     }
 
-    fn read_u8(&mut self) -> Result<u8, ClickHouseSourceError> {
-        let mut buf = [0u8; 1];
+    fn read_bytes<const N: usize>(&mut self) -> Result<[u8; N], ClickHouseSourceError> {
+        let mut buf = [0u8; N];
         self.cursor
             .read_exact(&mut buf)
-            .map_err(|e| anyhow!("Failed to read u8: {}", e))?;
-        Ok(buf[0])
+            .map_err(|e| anyhow!("Failed to read {} bytes: {}", N, e))?;
+        Ok(buf)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, ClickHouseSourceError> {
+        Ok(self.read_bytes::<1>()?[0])
     }
 
     fn read_i8(&mut self) -> Result<i8, ClickHouseSourceError> {
@@ -346,67 +350,35 @@ impl<'a> BinaryReader<'a> {
     }
 
     fn read_u16(&mut self) -> Result<u16, ClickHouseSourceError> {
-        let mut buf = [0u8; 2];
-        self.cursor
-            .read_exact(&mut buf)
-            .map_err(|e| anyhow!("Failed to read u16: {}", e))?;
-        Ok(u16::from_le_bytes(buf))
+        Ok(u16::from_le_bytes(self.read_bytes()?))
     }
 
     fn read_i16(&mut self) -> Result<i16, ClickHouseSourceError> {
-        let mut buf = [0u8; 2];
-        self.cursor
-            .read_exact(&mut buf)
-            .map_err(|e| anyhow!("Failed to read i16: {}", e))?;
-        Ok(i16::from_le_bytes(buf))
+        Ok(i16::from_le_bytes(self.read_bytes()?))
     }
 
     fn read_u32(&mut self) -> Result<u32, ClickHouseSourceError> {
-        let mut buf = [0u8; 4];
-        self.cursor
-            .read_exact(&mut buf)
-            .map_err(|e| anyhow!("Failed to read u32: {}", e))?;
-        Ok(u32::from_le_bytes(buf))
+        Ok(u32::from_le_bytes(self.read_bytes()?))
     }
 
     fn read_i32(&mut self) -> Result<i32, ClickHouseSourceError> {
-        let mut buf = [0u8; 4];
-        self.cursor
-            .read_exact(&mut buf)
-            .map_err(|e| anyhow!("Failed to read i32: {}", e))?;
-        Ok(i32::from_le_bytes(buf))
+        Ok(i32::from_le_bytes(self.read_bytes()?))
     }
 
     fn read_u64(&mut self) -> Result<u64, ClickHouseSourceError> {
-        let mut buf = [0u8; 8];
-        self.cursor
-            .read_exact(&mut buf)
-            .map_err(|e| anyhow!("Failed to read u64: {}", e))?;
-        Ok(u64::from_le_bytes(buf))
+        Ok(u64::from_le_bytes(self.read_bytes()?))
     }
 
     fn read_i64(&mut self) -> Result<i64, ClickHouseSourceError> {
-        let mut buf = [0u8; 8];
-        self.cursor
-            .read_exact(&mut buf)
-            .map_err(|e| anyhow!("Failed to read i64: {}", e))?;
-        Ok(i64::from_le_bytes(buf))
+        Ok(i64::from_le_bytes(self.read_bytes()?))
     }
 
     fn read_f32(&mut self) -> Result<f32, ClickHouseSourceError> {
-        let mut buf = [0u8; 4];
-        self.cursor
-            .read_exact(&mut buf)
-            .map_err(|e| anyhow!("Failed to read f32: {}", e))?;
-        Ok(f32::from_le_bytes(buf))
+        Ok(f32::from_le_bytes(self.read_bytes()?))
     }
 
     fn read_f64(&mut self) -> Result<f64, ClickHouseSourceError> {
-        let mut buf = [0u8; 8];
-        self.cursor
-            .read_exact(&mut buf)
-            .map_err(|e| anyhow!("Failed to read f64: {}", e))?;
-        Ok(f64::from_le_bytes(buf))
+        Ok(f64::from_le_bytes(self.read_bytes()?))
     }
 
     fn read_varint(&mut self) -> Result<u64, ClickHouseSourceError> {
@@ -439,11 +411,8 @@ impl<'a> BinaryReader<'a> {
         // ClickHouse stores UUID as two UInt64 in big-endian order
         let high = self.read_u64()?;
         let low = self.read_u64()?;
-        // Reconstruct UUID bytes
-        let mut bytes = [0u8; 16];
-        bytes[0..8].copy_from_slice(&high.to_be_bytes());
-        bytes[8..16].copy_from_slice(&low.to_be_bytes());
-        Ok(Uuid::from_bytes(bytes))
+
+        Ok(Uuid::from_u64_pair(high, low))
     }
 
     fn read_bool(&mut self) -> Result<bool, ClickHouseSourceError> {
@@ -507,20 +476,28 @@ impl<'a> BinaryReader<'a> {
             .ok_or_else(|| anyhow!("Invalid datetime64 value").into())
     }
 
-    fn read_decimal32(&mut self, scale: u8) -> Result<Decimal, ClickHouseSourceError> {
-        let raw = self.read_i32()?;
-        let mut dec = Decimal::from(raw);
+    fn read_decimal<T, F>(
+        &mut self,
+        scale: u8,
+        read_raw: F,
+    ) -> Result<Decimal, ClickHouseSourceError>
+    where
+        T: Into<Decimal>,
+        F: FnOnce(&mut Self) -> Result<T, ClickHouseSourceError>,
+    {
+        let raw = read_raw(self)?;
+        let mut dec: Decimal = raw.into();
         dec.set_scale(scale as u32)
             .map_err(|e| anyhow!("Failed to set decimal scale: {}", e))?;
         Ok(dec)
     }
 
+    fn read_decimal32(&mut self, scale: u8) -> Result<Decimal, ClickHouseSourceError> {
+        self.read_decimal(scale, Self::read_i32)
+    }
+
     fn read_decimal64(&mut self, scale: u8) -> Result<Decimal, ClickHouseSourceError> {
-        let raw = self.read_i64()?;
-        let mut dec = Decimal::from(raw);
-        dec.set_scale(scale as u32)
-            .map_err(|e| anyhow!("Failed to set decimal scale: {}", e))?;
-        Ok(dec)
+        self.read_decimal(scale, Self::read_i64)
     }
 
     fn read_time(&mut self) -> Result<NaiveTime, ClickHouseSourceError> {
@@ -546,19 +523,11 @@ impl<'a> BinaryReader<'a> {
     }
 
     fn read_ipv4(&mut self) -> Result<IpAddr, ClickHouseSourceError> {
-        let mut buf = [0u8; 4];
-        self.cursor
-            .read_exact(&mut buf)
-            .map_err(|e| anyhow!("Failed to read IPv4: {}", e))?;
-        Ok(IpAddr::V4(Ipv4Addr::from(buf)))
+        Ok(IpAddr::V4(Ipv4Addr::from(self.read_bytes()?)))
     }
 
     fn read_ipv6(&mut self) -> Result<IpAddr, ClickHouseSourceError> {
-        let mut buf = [0u8; 16];
-        self.cursor
-            .read_exact(&mut buf)
-            .map_err(|e| anyhow!("Failed to read IPv6: {}", e))?;
-        Ok(IpAddr::V6(Ipv6Addr::from(buf)))
+        Ok(IpAddr::V6(Ipv6Addr::from(self.read_bytes()?)))
     }
 
     fn read_enum8(&mut self) -> Result<i8, ClickHouseSourceError> {
@@ -567,6 +536,18 @@ impl<'a> BinaryReader<'a> {
 
     fn read_enum16(&mut self) -> Result<i16, ClickHouseSourceError> {
         self.read_i16()
+    }
+
+    fn read_array<T, F>(&mut self, read_elem: F) -> Result<Vec<Option<T>>, ClickHouseSourceError>
+    where
+        F: Fn(&mut Self) -> Result<T, ClickHouseSourceError>,
+    {
+        let len = self.read_varint()? as usize;
+        let mut result = Vec::with_capacity(len);
+        for _ in 0..len {
+            result.push(Some(read_elem(self)?));
+        }
+        Ok(result)
     }
 
     fn is_empty(&self) -> bool {
@@ -679,7 +660,50 @@ impl<'a> ClickHouseSourceParser<'a> {
 
                 ClickHouseTypeSystem::Bool(_) => DataType::Bool(reader.read_bool()?),
 
-                _ => DataType::Null, // For unsupported types, we can choose to return Null or throw an error. Here we choose Null for simplicity.
+                ClickHouseTypeSystem::ArrayBool(_) => {
+                    DataType::ArrayBool(reader.read_array(BinaryReader::read_bool)?)
+                }
+                ClickHouseTypeSystem::ArrayString(_) => {
+                    DataType::ArrayString(reader.read_array(BinaryReader::read_string)?)
+                }
+                ClickHouseTypeSystem::ArrayInt8(_) => {
+                    DataType::ArrayInt8(reader.read_array(BinaryReader::read_i8)?)
+                }
+                ClickHouseTypeSystem::ArrayInt16(_) => {
+                    DataType::ArrayInt16(reader.read_array(BinaryReader::read_i16)?)
+                }
+                ClickHouseTypeSystem::ArrayInt32(_) => {
+                    DataType::ArrayInt32(reader.read_array(BinaryReader::read_i32)?)
+                }
+                ClickHouseTypeSystem::ArrayInt64(_) => {
+                    DataType::ArrayInt64(reader.read_array(BinaryReader::read_i64)?)
+                }
+                ClickHouseTypeSystem::ArrayUInt8(_) => {
+                    DataType::ArrayUInt8(reader.read_array(BinaryReader::read_u8)?)
+                }
+                ClickHouseTypeSystem::ArrayUInt16(_) => {
+                    DataType::ArrayUInt16(reader.read_array(BinaryReader::read_u16)?)
+                }
+                ClickHouseTypeSystem::ArrayUInt32(_) => {
+                    DataType::ArrayUInt32(reader.read_array(BinaryReader::read_u32)?)
+                }
+                ClickHouseTypeSystem::ArrayUInt64(_) => {
+                    DataType::ArrayUInt64(reader.read_array(BinaryReader::read_u64)?)
+                }
+                ClickHouseTypeSystem::ArrayFloat32(_) => {
+                    DataType::ArrayFloat32(reader.read_array(BinaryReader::read_f32)?)
+                }
+                ClickHouseTypeSystem::ArrayFloat64(_) => {
+                    DataType::ArrayFloat64(reader.read_array(BinaryReader::read_f64)?)
+                }
+                ClickHouseTypeSystem::ArrayDecimal32(_) => {
+                    let scale = meta.scale;
+                    DataType::ArrayDecimal32(reader.read_array(|r| r.read_decimal32(scale))?)
+                }
+                ClickHouseTypeSystem::ArrayDecimal64(_) => {
+                    let scale = meta.scale;
+                    DataType::ArrayDecimal64(reader.read_array(|r| r.read_decimal64(scale))?)
+                }
             };
 
             row.push(value);

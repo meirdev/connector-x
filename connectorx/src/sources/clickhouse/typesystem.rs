@@ -2,6 +2,7 @@ use std::net::IpAddr;
 
 use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
 use chrono_tz::Tz;
+use regex::Regex;
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
@@ -155,33 +156,29 @@ impl ClickHouseTypeSystem {
         let type_str = type_str.trim();
         let mut metadata = TypeMetadata::default();
 
-        let (type_str, nullable) = if type_str.starts_with("Nullable(") && type_str.ends_with(')') {
-            let inner = &type_str[9..type_str.len() - 1];
-            (inner, true)
-        } else {
-            (type_str, false)
-        };
+        let (type_str, nullable) = Self::unwrap_nullable(type_str);
 
-        if type_str.starts_with("LowCardinality(") && type_str.ends_with(')') {
-            let inner = &type_str[15..type_str.len() - 1];
+        if let Some(inner) = Self::unwrap_wrapper(type_str, "LowCardinality") {
             return Self::from_type_str_with_metadata(inner);
         }
 
-        if type_str.starts_with("Enum8(") {
+        if let Some(inner) = Self::unwrap_wrapper(type_str, "Array") {
+            if let Some(array_type) = Self::parse_array_type(inner, nullable) {
+                return (array_type, metadata);
+            }
+            return (String(nullable), metadata);
+        }
+
+        if let Some(params) = Self::unwrap_wrapper(type_str, "Enum8") {
+            metadata.named_values = Self::parse_enum_definition(params);
             return (Enum8(nullable), metadata);
         }
-        if type_str.starts_with("Enum16(") {
+        if let Some(params) = Self::unwrap_wrapper(type_str, "Enum16") {
+            metadata.named_values = Self::parse_enum_definition(params);
             return (Enum16(nullable), metadata);
         }
 
-        // Extract base type and parameters
-        let (base_type, params) = if let Some(idx) = type_str.find('(') {
-            let base = &type_str[..idx];
-            let params_str = &type_str[idx + 1..type_str.len() - 1];
-            (base, Some(params_str))
-        } else {
-            (type_str, None)
-        };
+        let (base_type, params) = Self::split_type_params(type_str);
 
         let ts = match base_type {
             "Int8" => Int8(nullable),
@@ -204,9 +201,7 @@ impl ClickHouseTypeSystem {
             }
             "String" => String(nullable),
             "FixedString" => {
-                metadata.length = params
-                    .and_then(|p| p.trim().parse::<usize>().ok())
-                    .unwrap_or(1);
+                metadata.length = Self::parse_length(params);
                 FixedString(nullable)
             }
             "Date" => Date(nullable),
@@ -214,21 +209,13 @@ impl ClickHouseTypeSystem {
             "Time" => Time(nullable),
             "Time64" => Time64(nullable),
             "DateTime" => {
-                // DateTime can have optional timezone: DateTime('Asia/Istanbul')
-                metadata.timezone = params.and_then(Self::parse_timezone);
+                metadata.timezone = Self::parse_datetime_params(params).1;
                 DateTime(nullable)
             }
             "DateTime64" => {
-                // DateTime64(precision) or DateTime64(precision, 'timezone')
-                if let Some(p) = params {
-                    let parts: Vec<&str> = p.splitn(2, ',').collect();
-                    metadata.precision = parts[0].trim().parse::<u8>().unwrap_or(3);
-                    if parts.len() > 1 {
-                        metadata.timezone = Self::parse_timezone(parts[1]);
-                    }
-                } else {
-                    metadata.precision = 3;
-                }
+                let (precision, tz) = Self::parse_datetime_params(params);
+                metadata.precision = precision.unwrap_or(3);
+                metadata.timezone = tz;
                 DateTime64(nullable)
             }
             "UUID" => UUID(nullable),
@@ -243,6 +230,64 @@ impl ClickHouseTypeSystem {
 
     pub fn from_type_str(type_str: &str) -> Self {
         Self::from_type_str_with_metadata(type_str).0
+    }
+
+    /// Unwrap Nullable(X) -> (X, true) or (X, false)
+    fn unwrap_nullable(s: &str) -> (&str, bool) {
+        if let Some(inner) = Self::unwrap_wrapper(s, "Nullable") {
+            (inner, true)
+        } else {
+            (s, false)
+        }
+    }
+
+    /// Unwrap "Wrapper(inner)" -> Some(inner), or None if not matching
+    fn unwrap_wrapper<'a>(s: &'a str, wrapper: &str) -> Option<&'a str> {
+        let prefix = format!("{}(", wrapper);
+        if s.starts_with(&prefix) && s.ends_with(')') {
+            Some(&s[prefix.len()..s.len() - 1])
+        } else {
+            None
+        }
+    }
+
+    /// Split "Type(params)" into ("Type", Some("params"))
+    fn split_type_params(s: &str) -> (&str, Option<&str>) {
+        if let Some(idx) = s.find('(') {
+            if s.ends_with(')') {
+                let base = &s[..idx];
+                let params_str = &s[idx + 1..s.len() - 1];
+                return (base, Some(params_str));
+            }
+        }
+        (s, None)
+    }
+
+    /// Parse FixedString length parameter
+    fn parse_length(params: Option<&str>) -> usize {
+        params
+            .and_then(|p| p.trim().parse::<usize>().ok())
+            .unwrap_or(1)
+    }
+
+    /// Parse DateTime/DateTime64 parameters -> (Option<precision>, Option<timezone>)
+    fn parse_datetime_params(params: Option<&str>) -> (Option<u8>, Option<Tz>) {
+        match params {
+            None => (None, None),
+            Some(p) => {
+                let parts: Vec<&str> = p.splitn(2, ',').collect();
+                let first = parts[0].trim();
+
+                // Check if first part is a number (precision) or timezone
+                if let Ok(precision) = first.parse::<u8>() {
+                    let timezone = parts.get(1).and_then(|s| Self::parse_timezone(s));
+                    (Some(precision), timezone)
+                } else {
+                    // First part is timezone (DateTime case)
+                    (None, Self::parse_timezone(first))
+                }
+            }
+        }
     }
 
     fn parse_decimal_scale(params: Option<&str>) -> u8 {
@@ -265,6 +310,53 @@ impl ClickHouseTypeSystem {
         } else {
             None
         }
+    }
+
+    /// Parse Array(InnerType) and return the corresponding ArrayXxx variant
+    fn parse_array_type(inner_type: &str, nullable: bool) -> Option<Self> {
+        use ClickHouseTypeSystem::*;
+
+        let inner = inner_type.trim();
+
+        let inner = if let Some(unwrapped) = Self::unwrap_wrapper(inner, "Nullable") {
+            unwrapped
+        } else {
+            inner
+        };
+
+        let (base, _) = Self::split_type_params(inner);
+
+        match base {
+            "Bool" => Some(ArrayBool(nullable)),
+            "String" => Some(ArrayString(nullable)),
+            "Int8" => Some(ArrayInt8(nullable)),
+            "Int16" => Some(ArrayInt16(nullable)),
+            "Int32" => Some(ArrayInt32(nullable)),
+            "Int64" => Some(ArrayInt64(nullable)),
+            "UInt8" => Some(ArrayUInt8(nullable)),
+            "UInt16" => Some(ArrayUInt16(nullable)),
+            "UInt32" => Some(ArrayUInt32(nullable)),
+            "UInt64" => Some(ArrayUInt64(nullable)),
+            "Float32" => Some(ArrayFloat32(nullable)),
+            "Float64" => Some(ArrayFloat64(nullable)),
+            "Decimal" | "Decimal32" => Some(ArrayDecimal32(nullable)),
+            "Decimal64" => Some(ArrayDecimal64(nullable)),
+            _ => None,
+        }
+    }
+
+    /// Parse Enum8/Enum16 definitions like "'a' = 1, 'b' = 2, 'c' = 3"
+    fn parse_enum_definition(params: &str) -> Option<Vec<(String, i16)>> {
+        let re = Regex::new(r"'((?:\\'|[^'])*)'\s*=\s*(-?\d+)").unwrap();
+
+        re.captures_iter(params)
+            .map(|cap| {
+                let key = cap[1].replace("\\'", "'");
+                let value = cap[2].parse().unwrap();
+                (key, value)
+            })
+            .collect::<Vec<_>>()
+            .into()
     }
 
     pub fn is_nullable(&self) -> bool {
